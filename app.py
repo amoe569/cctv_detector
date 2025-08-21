@@ -10,26 +10,35 @@ import json
 import requests
 import threading
 from datetime import datetime, timedelta
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, request, jsonify
 from ultralytics import YOLO
 import numpy as np
 from dotenv import load_dotenv
+import pytz
+# 맨 위 import들 아래에 추가
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|"
+    "stimeout;5000000|"     # 5초(마이크로초 단위)
+    "max_delay;500000|"     # 0.5초
+    "buffer_size;262144"    # 256KB
+)
 
 # 환경 변수 로드
 load_dotenv()
 
+# 한국 시간대 설정
+KST = pytz.timezone('Asia/Seoul')
+
 app = Flask(__name__)
 
 # 설정
-API_BASE = os.getenv('API_BASE', 'http://localhost:8080')
+API_BASE = os.getenv('API_BASE_URL', os.getenv('API_BASE', 'http://localhost:8080'))
 SCORE_THRESHOLD = float(os.getenv('SCORE_THRESHOLD', '0.4'))
 
-# RTSP 스트림 설정
+# RTSP 스트림 설정 (cam-001, cam-002만 유지)
 RTSP_STREAMS = {
     "cam-001": "rtsp://210.99.70.120:1935/live/cctv001.stream",
-    "cam-002": "rtsp://210.99.70.120:1935/live/cctv002.stream",
-    "cam-003": "rtsp://210.99.70.120:1935/live/cctv003.stream",
-    "cam-004": "rtsp://210.99.70.120:1935/live/cctv004.stream"
+    "cam-002": "rtsp://210.99.70.120:1935/live/cctv002.stream"
 }
 
 # 전역 변수
@@ -91,7 +100,7 @@ def detect_objects_yolo(frame, camera_id):
                 "type": detection_type,
                 "severity": 3,  # 사람과 차량은 모두 높은 우선순위
                 "score": score,
-                "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+                "ts": datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
                 "boundingBox": {"x": x, "y": y, "w": w, "h": h}
             })
         return detections
@@ -141,7 +150,7 @@ def detect_objects_yolo(frame, camera_id):
                                 "type": class_name,
                                 "severity": 3,  # 사람과 차량은 모두 높은 우선순위
                                 "score": conf,
-                                "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+                                "ts": datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
                                 "boundingBox": {
                                     "x": scaled_x1,
                                     "y": scaled_y1,
@@ -201,61 +210,109 @@ def send_traffic_event_to_api(camera_id, traffic_event):
     """Spring Boot API로 '통행량 많음' 이벤트 전송 (WARNING 상태 체크 포함)"""
     # 카메라 상태 확인
     camera_status_from_api = check_camera_status_from_api(camera_id)
-    
     if camera_status_from_api == "WARNING":
         print(f"🟠 {camera_id}: WARNING 상태이므로 이벤트 전송을 스킵합니다.")
-        return
-    
+        return False  # ✅ 반환 추가
+
     event_data = {
         "cameraId": camera_id,
         "type": "traffic_heavy",
-        "severity": 2,  # 경고 레벨
+        "severity": 2,
         "score": 1.0,
         "ts": traffic_event["ts"],
         "boundingBox": traffic_event["boundingBox"],
-        "vehicleCount": traffic_event["vehicle_count"],
+        "vehicleCount": traffic_event["vehicle_count"],  # camelCase로 전송
         "message": f"차량 {traffic_event['vehicle_count']}대 감지로 인한 통행량 많음"
     }
-    
+
     print(f"🚗 {camera_id}: 이벤트 전송 시도 - {event_data}")
-    print(f"🌐 API URL: {API_BASE}/api/events/traffic")
-    
+    url = f"{API_BASE}/api/events/traffic"
+    print(f"🌐 API URL: {url}")
+
     try:
         response = requests.post(
-            f"{API_BASE}/api/events/traffic",
-            json=event_data,
-            headers={"Content-Type": "application/json"},
-            timeout=10
+            url, json=event_data, headers={"Content-Type": "application/json"}, timeout=10
         )
-        
         print(f"📡 응답 상태: HTTP {response.status_code}")
         print(f"📡 응답 헤더: {dict(response.headers)}")
-        
-        if response.status_code == 200:
-            result = response.json()
+
+        # ✅ 성공 기준은 2xx 전체로
+        if 200 <= response.status_code < 300:
+            # 본문이 JSON이 아닐 수도 있으므로 방어적으로 처리
+            try:
+                print(f"📋 응답 데이터: {response.json()}")
+            except Exception:
+                print(f"📋 응답 본문(텍스트): {response.text[:200]}")
             print(f"✅ {camera_id}: '통행량 많음' 이벤트 전송 성공")
-            print(f"📋 응답 데이터: {result}")
-        else:
-            print(f"❌ {camera_id}: '통행량 많음' 이벤트 전송 실패 - HTTP {response.status_code}")
-            print(f"📋 오류 응답: {response.text}")
-            
+            return True  # ✅ 성공 반환
+
+        print(f"❌ {camera_id}: 이벤트 전송 실패 - HTTP {response.status_code}")
+        print(f"📋 오류 응답: {response.text[:500]}")
+        return False  # ✅ 실패 반환
+
     except requests.exceptions.ConnectionError as e:
-        print(f"❌ {camera_id}: 연결 오류 - Spring Boot 서버가 실행 중인지 확인하세요: {e}")
+        print(f"❌ {camera_id}: 연결 오류: {e}")
+        return False
     except requests.exceptions.Timeout as e:
-        print(f"❌ {camera_id}: 타임아웃 오류: {e}")
+        print(f"❌ {camera_id}: 타임아웃: {e}")
+        return False
     except Exception as e:
-        print(f"❌ {camera_id}: '통행량 많음' 이벤트 전송 오류: {e}")
-        print(f"🔍 오류 타입: {type(e).__name__}")
+        print(f"❌ {camera_id}: 기타 오류: {e} ({type(e).__name__})")
+        return False
+
+@app.route('/api/test-event', methods=['POST'])
+def test_event():
+    """테스트 이벤트 API 엔드포인트"""
+    try:
+        data = request.get_json(silent=True) or {}
+        camera_id = data.get('cameraId')
+        if not camera_id:
+            return jsonify({'success': False, 'message': 'cameraId가 필요합니다.'}), 400
+        if camera_id not in RTSP_STREAMS:
+            return jsonify({'success': False, 'message': f'알 수 없는 카메라: {camera_id}'}), 404
+
+        # 테스트 이벤트 데이터
+        test_event = {
+            "type": "traffic_heavy",
+            "severity": 2,
+            "score": 1.0,
+            "ts": datetime.now(KST).isoformat(),
+            "boundingBox": {"x": 0, "y": 0, "w": 0, "h": 0},
+            "vehicle_count": int(data.get('vehicleCount', 15)),  # 기본 15
+            "message": "테스트: 차량 다수 감지"
+        }
+
+        success = send_traffic_event_to_api(camera_id, test_event)
+        if success:
+            return jsonify({
+                'success': True,
+                'message': f'{camera_id}에 테스트 이벤트 전송 성공',
+                'event': test_event
+            }), 200
+
+        # 실패 상세 메시지 제공(서버 로그를 참조하라고 안내)
+        return jsonify({
+            'success': False,
+            'message': '테스트 이벤트 전송 실패 (서버 로그 확인 필요)'
+        }), 502  # 게이트웨이/백엔드 실패 의미
+
+    except Exception as e:
+        # ✅ 예외는 500으로
+        return jsonify({
+            'success': False,
+            'message': f'서버 오류: {str(e)}'
+        }), 500
 
 def send_video_metadata(camera_id, frame):
-    """비디오 메타데이터 전송"""
+    """비디오 메타데이터 전송 - Java DTO에 맞게 수정"""
+    now = datetime.now(KST)
     metadata = {
         "cameraId": camera_id,
-        "filename": f"{camera_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
-        "duration": 5,
-        "size": frame.shape[0] * frame.shape[1] * 3,
-        "format": "MP4",
-        "createdAt": datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+        "startTs": now.strftime("%Y-%m-%dT%H:%M:%S"),
+        "endTs": (now + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%S"),
+        "path": f"/videos/{camera_id}_{now.strftime('%Y%m%d_%H%M%S')}.mp4",
+        "fileSizeBytes": frame.shape[0] * frame.shape[1] * 3,
+        "codec": "H.264"
     }
     try:
         response = requests.post(
@@ -268,8 +325,17 @@ def send_video_metadata(camera_id, frame):
             print(f"✅ {camera_id}: 비디오 메타데이터 전송 성공")
         else:
             print(f"❌ {camera_id}: 비디오 메타데이터 전송 실패 - HTTP {response.status_code}")
+            print(f"🔍 응답 내용: {response.text}")
+    except requests.exceptions.ConnectionError as e:
+        print(f"❌ {camera_id}: 메타데이터 연결 오류 - Spring Boot 서버 확인: {e}")
+    except requests.exceptions.Timeout as e:
+        print(f"❌ {camera_id}: 메타데이터 타임아웃 오류: {e}")
     except Exception as e:
         print(f"❌ {camera_id}: 비디오 메타데이터 전송 오류: {e}")
+
+
+
+
 
 def capture_rtsp_stream(camera_id, rtsp_url):
     """RTSP 스트림에서 프레임을 지속적으로 캡처"""
@@ -281,9 +347,49 @@ def capture_rtsp_stream(camera_id, rtsp_url):
     
     while reconnect_count < max_reconnect_attempts:
         try:
-            cap = cv2.VideoCapture(rtsp_url)
+            # 방법 1: 기본 RTSP 연결
+            print(f"🔗 {camera_id}: RTSP 연결 시도 중...")
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             cap.set(cv2.CAP_PROP_FPS, 10)  # FPS 설정
+            
+            # RTSP 스트림 최적화 설정
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))  # H.264 코덱 강제 설정
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)   # 프레임 너비 강제 설정
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # 프레임 높이 강제 설정
+            
+            # 방법 2: RTSP URL 파라미터 추가 (연결 안정성 향상)
+            if not cap.isOpened():
+                print(f"🔄 {camera_id}: 기본 연결 실패, RTSP 파라미터 추가로 재시도...")
+                enhanced_url = f"{rtsp_url}?tcp&timeout=10"
+                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap.set(cv2.CAP_PROP_FPS, 10)
+            
+            # 방법 3: FFmpeg을 통한 RTSP 처리 (최후의 수단)
+            if not cap.isOpened():
+                print(f"🔄 {camera_id}: RTSP 연결 실패, FFmpeg 방식으로 재시도...")
+                # FFmpeg 명령어로 RTSP 스트림을 파이프로 받기
+                import subprocess
+                try:
+                    ffmpeg_cmd = [
+                        'ffmpeg', '-i', rtsp_url,
+                        '-f', 'rawvideo',
+                        '-pix_fmt', 'bgr24',
+                        '-s', '640x480',
+                        '-r', '10',
+                        '-'
+                    ]
+                    ffmpeg_process = subprocess.Popen(
+                        ffmpeg_cmd, 
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.PIPE,
+                        bufsize=10**8
+                    )
+                    print(f"✅ {camera_id}: FFmpeg 프로세스 시작됨")
+                except Exception as e:
+                    print(f"❌ {camera_id}: FFmpeg 시작 실패: {e}")
+                    break
             
             # 프레임 크기를 일관되게 설정 (YOLOv8 호환성)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -315,13 +421,17 @@ def capture_rtsp_stream(camera_id, rtsp_url):
                     consecutive_failures += 1
                     print(f"⚠️ {camera_id}: 프레임 읽기 실패 ({consecutive_failures}회 연속)")
                     
-                    if consecutive_failures >= 5:  # 5회 연속 실패 시 재연결
+                    # 프레임 읽기 실패 시 추가 대기 및 재시도
+                    if consecutive_failures < 3:
+                        time.sleep(0.5)  # 짧은 대기
+                        continue
+                    elif consecutive_failures < 5:  # 5회 연속 실패 시 재연결
+                        time.sleep(1.0)  # 긴 대기
+                        continue
+                    else:
                         print(f"🔄 {camera_id}: 연속 실패로 인한 재연결 시도")
                         camera_status[camera_id] = "ERROR"
                         break
-                    
-                    time.sleep(1)
-                    continue
 
                 consecutive_failures = 0  # 성공 시 실패 카운트 리셋
                 frame_count += 1
@@ -344,7 +454,7 @@ def capture_rtsp_stream(camera_id, rtsp_url):
                             "type": "traffic_heavy",
                             "severity": 2,  # 경고 레벨
                             "score": 1.0,
-                            "ts": datetime.now().isoformat(),
+                            "ts": datetime.now(KST).isoformat(),
                             "boundingBox": {"x": 0, "y": 0, "w": 0, "h": 0},
                             "vehicle_count": vehicle_count
                         }
@@ -411,7 +521,7 @@ def generate_mjpeg_stream(camera_id):
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
 
         # 현재 시간 표시
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
         cv2.putText(frame, current_time, (10, 60), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
@@ -542,23 +652,7 @@ def index():
                     </div>
                 </div>
 
-                <div class="camera">
-                    <h3>📹 {cam_003_name} <span style="color: #FF9800;">[스트림만]</span></h3>
-                    <p>상태: <span class="{cam_003_status_class}">{cam_003_status}</span></p>
-                    <p>RTSP: {cam_003_rtsp}</p>
-                    <div class="stream">
-                        <img src="/stream/cam-003" alt="Camera 3 Stream" />
-                    </div>
-                </div>
 
-                <div class="camera">
-                    <h3>📹 {cam_004_name} <span style="color: #FF9800;">[스트림만]</span></h3>
-                    <p>상태: <span class="{cam_004_status_class}">{cam_004_status}</span></p>
-                    <p>RTSP: {cam_004_rtsp}</p>
-                    <div class="stream">
-                        <img src="/stream/cam-004" alt="Camera 4 Stream" />
-                    </div>
-                </div>
             </div>
             
             <div class="test-event-panel">
@@ -568,8 +662,6 @@ def index():
                         <option value="">카메라 선택</option>
                         <option value="cam-001">세집매 삼거리 (cam-001)</option>
                         <option value="cam-002">서부역 입구 삼거리 (cam-002)</option>
-                        <option value="cam-003">역말 오거리 (cam-003)</option>
-                        <option value="cam-004">천안로사거리 (cam-004)</option>
                     </select>
                     <button onclick="sendTestEvent()">🚗 통행량 많음 이벤트 발령</button>
                     <div id="testResult" class="test-result"></div>
@@ -606,7 +698,7 @@ def index():
                 
                 showResult('이벤트 전송 중...', 'success');
                 
-                fetch('{API_BASE}/api/events/traffic', {{
+                fetch('/api/test-event', {{
                     method: 'POST',
                     headers: {{
                         'Content-Type': 'application/json',
@@ -662,15 +754,7 @@ def index():
         cam_002_name="서부역 입구 삼거리",
         cam_002_status=camera_status.get("cam-002", "UNKNOWN"),
         cam_002_status_class="online" if camera_status.get("cam-002") == "ONLINE" else "error",
-        cam_002_rtsp=RTSP_STREAMS["cam-002"],
-        cam_003_name="역말 오거리",
-        cam_003_status=camera_status.get("cam-003", "UNKNOWN"),
-        cam_003_status_class="online" if camera_status.get("cam-003") == "ONLINE" else "error",
-        cam_003_rtsp=RTSP_STREAMS["cam-003"],
-        cam_004_name="천안로사거리",
-        cam_004_status=camera_status.get("cam-004", "UNKNOWN"),
-        cam_004_status_class="online" if camera_status.get("cam-004") == "ONLINE" else "error",
-        cam_004_rtsp=RTSP_STREAMS["cam-004"]
+        cam_002_rtsp=RTSP_STREAMS["cam-002"]
     )
 
 @app.route('/stream/<camera_id>')
@@ -773,7 +857,7 @@ def camera_status_page():
                 <td style="padding: 10px;">{cam_id}</td>
                 <td style="padding: 10px; color: {status_color};">{status}</td>
                 <td style="padding: 10px;">{rtsp_url}</td>
-                <td style="padding: 10px;">{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td>
+                <td style="padding: 10px;">{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}</td>
             </tr>
         """
     
@@ -785,7 +869,9 @@ def camera_status_page():
     """
     return status_html
 
-if __name__ == '__main__':
+# Docker 환경에서 Flask 앱 실행을 위한 설정
+def start_detector():
+    """Detector 서버 시작 함수"""
     print("🚀 CCTV AI Detector YOLOv8 RTSP Demo 시작 중...")
     print(f"📹 RTSP 스트림: {len(RTSP_STREAMS)}개 카메라")
     print(f"🌐 API 서버: {API_BASE}")
@@ -814,5 +900,7 @@ if __name__ == '__main__':
     print("📊 상태 정보: http://localhost:5001/status")
     print("\n💡 Spring Boot를 실행한 후 이 페이지에서 실시간 YOLOv8 객체 탐지를 확인하세요!")
 
-    # Flask 앱 실행
+if __name__ == '__main__':
+    start_detector()  # ✅ 스레드 시작 (비블로킹)
     app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
+

@@ -1,0 +1,46 @@
+# Python Detector .dockerignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Models (will be downloaded during build)
+*.pt
+*.onnx
+runs/
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+README*.md
+
+# Temporary files
+*.tmp
+*.temp
+
+# Environment
+.env
