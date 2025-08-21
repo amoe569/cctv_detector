@@ -35,17 +35,126 @@ app = Flask(__name__)
 API_BASE = os.getenv('API_BASE_URL', os.getenv('API_BASE', 'http://localhost:8080'))
 SCORE_THRESHOLD = float(os.getenv('SCORE_THRESHOLD', '0.4'))
 
-# RTSP 스트림 설정 (cam-001, cam-002만 유지)
-RTSP_STREAMS = {
-    "cam-001": "rtsp://210.99.70.120:1935/live/cctv001.stream",
-    "cam-002": "rtsp://210.99.70.120:1935/live/cctv002.stream"
-}
-
 # 전역 변수
-camera_frames = {cam_id: None for cam_id in RTSP_STREAMS.keys()}
-camera_locks = {cam_id: threading.Lock() for cam_id in RTSP_STREAMS.keys()}
-camera_status = {cam_id: "UNKNOWN" for cam_id in RTSP_STREAMS.keys()}
+RTSP_STREAMS = {}  # 데이터베이스에서 동적으로 로드
+camera_frames = {}
+camera_locks = {}
+camera_status = {}
+camera_threads = {}  # 카메라별 스레드 추적
+camera_yolo_enabled = {}  # 각 카메라의 YOLO 활성화 상태
 model = None
+camera_reload_interval = 30  # 30초마다 카메라 정보 다시 로드
+
+def load_cameras_from_api():
+    """Control Center API에서 카메라 정보 로드"""
+    global RTSP_STREAMS, camera_frames, camera_locks, camera_status, camera_threads, camera_yolo_enabled
+    
+    try:
+        print(f"🔍 카메라 정보 로드 중... ({API_BASE}/api/cameras)")
+        response = requests.get(f"{API_BASE}/api/cameras", timeout=10)
+        response.raise_for_status()
+        
+        cameras = response.json()
+        print(f"📊 총 {len(cameras)}개 카메라 발견")
+        
+        # 모든 카메라를 스트리밍 연결 (YOLO 여부와 무관)
+        new_streams = {}
+        yolo_enabled_count = 0
+        for camera in cameras:
+            cam_id = camera['id']
+            rtsp_url = camera.get('rtspUrl')
+            yolo_enabled = camera.get('yoloEnabled', False)
+            
+            if rtsp_url:
+                new_streams[cam_id] = rtsp_url
+                if yolo_enabled:
+                    yolo_enabled_count += 1
+                    print(f"✅ 카메라 {cam_id} 등록: {rtsp_url} (YOLO: 활성화)")
+                else:
+                    print(f"✅ 카메라 {cam_id} 등록: {rtsp_url} (YOLO: 비활성화)")
+            else:
+                print(f"⚠️  카메라 {cam_id}: RTSP URL 없음")
+        
+        print(f"🎯 YOLO 활성화된 카메라: {yolo_enabled_count}개 / 총 {len(new_streams)}개")
+        
+        # 변경사항 감지 및 처리
+        old_cameras = set(RTSP_STREAMS.keys())
+        new_cameras = set(new_streams.keys())
+        
+        # 삭제된 카메라 처리
+        removed_cameras = old_cameras - new_cameras
+        for cam_id in removed_cameras:
+            print(f"🗑️  카메라 {cam_id} 제거됨")
+            # 해당 카메라의 스레드는 자연스럽게 종료됨 (RTSP_STREAMS에서 제거되면)
+            if cam_id in camera_frames:
+                del camera_frames[cam_id]
+            if cam_id in camera_locks:
+                del camera_locks[cam_id]
+            if cam_id in camera_status:
+                del camera_status[cam_id]
+            if cam_id in camera_yolo_enabled:
+                del camera_yolo_enabled[cam_id]
+        
+        # 추가된 카메라 처리
+        added_cameras = new_cameras - old_cameras
+        for cam_id in added_cameras:
+            print(f"➕ 새 카메라 {cam_id} 추가됨")
+            camera_frames[cam_id] = None
+            camera_locks[cam_id] = threading.Lock()
+            camera_status[cam_id] = "UNKNOWN"
+            camera_yolo_enabled[cam_id] = False  # 새 카메라는 일단 비활성화로 초기화
+            
+            # 새 카메라의 RTSP 스레드 시작
+            thread = threading.Thread(
+                target=capture_rtsp_stream,
+                args=(cam_id, new_streams[cam_id]),
+                daemon=True,
+                name=f"RTSP-{cam_id}"
+            )
+            thread.start()
+            camera_threads[cam_id] = thread
+            print(f"🔄 {cam_id} RTSP 스트림 처리 스레드 시작")
+        
+        # RTSP_STREAMS 및 YOLO 설정 업데이트
+        RTSP_STREAMS.clear()
+        RTSP_STREAMS.update(new_streams)
+        
+        # 각 카메라의 YOLO 설정 저장
+        for camera in cameras:
+            cam_id = camera['id']
+            if cam_id in new_streams:  # 스트리밍 연결된 카메라만
+                camera_yolo_enabled[cam_id] = camera.get('yoloEnabled', False)
+        
+        print(f"🎉 카메라 로드 완료: {list(RTSP_STREAMS.keys())}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ 카메라 정보 로드 실패: {e}")
+        # 첫 실행 시에만 기본 카메라 설정 사용
+        if not RTSP_STREAMS:
+            fallback_streams = {
+                "cam-001": "rtsp://210.99.70.120:1935/live/cctv001.stream",
+                "cam-002": "rtsp://210.99.70.120:1935/live/cctv002.stream"
+            }
+            RTSP_STREAMS.update(fallback_streams)
+            for cam_id in fallback_streams:
+                camera_frames[cam_id] = None
+                camera_locks[cam_id] = threading.Lock()
+                camera_status[cam_id] = "UNKNOWN"
+                camera_yolo_enabled[cam_id] = True  # 기본 카메라는 YOLO 활성화
+            print(f"🔄 기본 카메라 설정 사용: {list(RTSP_STREAMS.keys())}")
+        return False
+
+def periodic_camera_reload():
+    """주기적으로 카메라 정보를 다시 로드하는 함수"""
+    while True:
+        try:
+            time.sleep(camera_reload_interval)
+            print(f"🔄 주기적 카메라 정보 업데이트 ({camera_reload_interval}초 간격)")
+            load_cameras_from_api()
+        except Exception as e:
+            print(f"❌ 주기적 카메라 로드 오류: {e}")
+            time.sleep(10)  # 오류 시 10초 후 재시도
 
 def load_yolo_model():
     """YOLOv8 모델 로드"""
@@ -65,15 +174,43 @@ def detect_objects_yolo(frame, camera_id):
     """YOLOv8을 사용한 객체 탐지 - 사람과 차량만 필터링"""
     detections = []
     
-    # 프레임 크기를 일관되게 조정 (YOLOv8 호환성)
+    # YOLO가 비활성화된 카메라는 빈 결과 반환
+    if not camera_yolo_enabled.get(camera_id, False):
+        return detections
+    
+    # 프레임 유효성 검증 및 전처리
     try:
+        # 프레임이 None이거나 비어있는지 확인
+        if frame is None:
+            print(f"⚠️ {camera_id}: 프레임이 None입니다")
+            return detections
+        
+        # 프레임 차원 검증
+        if len(frame.shape) < 2:
+            print(f"⚠️ {camera_id}: 잘못된 프레임 차원 {frame.shape}")
+            return detections
+        
+        # 그레이스케일 프레임을 BGR로 변환
+        if len(frame.shape) == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif len(frame.shape) == 3 and frame.shape[2] == 1:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif len(frame.shape) == 3 and frame.shape[2] == 4:
+            # RGBA를 BGR로 변환
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        
         # 원본 프레임 크기 저장
-        original_height, original_width = frame.shape[:2]
+        if len(frame.shape) >= 2:
+            original_height, original_width = frame.shape[:2]
+        else:
+            print(f"❌ {camera_id}: 프레임 크기 추출 실패: {frame.shape}")
+            return detections
         
         # 프레임을 640x640으로 리사이즈 (YOLOv8 표준 입력 크기)
         resized_frame = cv2.resize(frame, (640, 640))
+        
     except Exception as e:
-        print(f"❌ {camera_id}: 프레임 리사이즈 실패: {e}")
+        print(f"❌ {camera_id}: 프레임 전처리 실패: {e}")
         return detections
     
     # 사람과 차량 관련 클래스 정의
@@ -106,8 +243,13 @@ def detect_objects_yolo(frame, camera_id):
         return detections
     
     try:
-        # YOLOv8 탐지 수행 (리사이즈된 프레임 사용)
-        results = model(resized_frame, verbose=False)
+        # 프레임 최종 검증
+        if resized_frame is None or resized_frame.size == 0:
+            print(f"⚠️ {camera_id}: 리사이즈된 프레임이 비어있습니다")
+            return detections
+        
+        # YOLOv8 탐지 수행 (더 안전한 방식)
+        results = model.predict(resized_frame, verbose=False, save=False, show=False)
         
         for result in results:
             boxes = result.boxes
@@ -205,6 +347,23 @@ def check_camera_status_from_api(camera_id):
     except Exception as e:
         print(f"⚠️ {camera_id}: 카메라 상태 조회 오류: {e}")
         return "UNKNOWN"
+
+def update_camera_status_to_api(camera_id, status):
+    """Spring Boot API로 카메라 상태 업데이트"""
+    try:
+        response = requests.put(
+            f"{API_BASE}/api/cameras/{camera_id}/status?status={status}",
+            timeout=5
+        )
+        if response.status_code == 200:
+            print(f"✅ {camera_id}: 카메라 상태 업데이트 성공 - {status}")
+            return True
+        else:
+            print(f"❌ {camera_id}: 카메라 상태 업데이트 실패 - HTTP {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"❌ {camera_id}: 카메라 상태 업데이트 오류: {e}")
+        return False
 
 def send_traffic_event_to_api(camera_id, traffic_event):
     """Spring Boot API로 '통행량 많음' 이벤트 전송 (WARNING 상태 체크 포함)"""
@@ -350,8 +509,14 @@ def capture_rtsp_stream(camera_id, rtsp_url):
             # 방법 1: 기본 RTSP 연결
             print(f"🔗 {camera_id}: RTSP 연결 시도 중...")
             cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # 버퍼링 최소화 설정
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 버퍼 크기 최소화
             cap.set(cv2.CAP_PROP_FPS, 10)  # FPS 설정
+            # 실시간 스트리밍 최적화
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 프레임 위치 초기화
+            # YUV 포맷 처리를 위한 색상 변환 활성화
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)  # RGB 변환 활성화 (YUV 문제 해결)
+            cap.set(cv2.CAP_PROP_FORMAT, cv2.CAP_PROP_FORMAT)  # 포맷 자동 설정
             
             # RTSP 스트림 최적화 설정
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))  # H.264 코덱 강제 설정
@@ -403,12 +568,17 @@ def capture_rtsp_stream(camera_id, rtsp_url):
             if not cap.isOpened():
                 print(f"❌ {camera_id}: RTSP 스트림 연결 실패 (시도 {reconnect_count + 1}/{max_reconnect_attempts})")
                 camera_status[camera_id] = "ERROR"
+                update_camera_status_to_api(camera_id, "ERROR")
                 reconnect_count += 1
                 time.sleep(reconnect_delay)
                 continue
 
             camera_status[camera_id] = "ONLINE"
             print(f"✅ {camera_id}: RTSP 스트림 연결 성공")
+            
+            # API로 카메라 상태 업데이트
+            update_camera_status_to_api(camera_id, "ONLINE")
+            
             reconnect_count = 0  # 성공 시 재연결 카운트 리셋
 
             frame_count = 0
@@ -416,7 +586,34 @@ def capture_rtsp_stream(camera_id, rtsp_url):
             consecutive_failures = 0  # 연속 실패 카운트
 
             while True:
-                ret, frame = cap.read()
+                # 버퍼 클리어로 최신 프레임 확보 (버퍼링 방지)
+                for _ in range(2):  # 최대 2개 프레임 건너뛰어 최신 프레임 가져오기
+                    temp_ret, temp_frame = cap.read()
+                    if temp_ret and temp_frame is not None:
+                        ret, frame = temp_ret, temp_frame
+                    else:
+                        break
+                else:
+                    ret, frame = cap.read()
+                
+                # 프레임 유효성 및 차원 검증
+                if ret and frame is not None:
+                    # 프레임 차원 검증 (최소 3차원이어야 함: height, width, channels)
+                    if len(frame.shape) < 2:
+                        print(f"⚠️ {camera_id}: 잘못된 프레임 차원 {frame.shape}, 건너뜀")
+                        continue
+                    elif len(frame.shape) == 2:
+                        # 그레이스케일인 경우 3채널로 변환
+                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    elif len(frame.shape) == 3 and frame.shape[2] == 1:
+                        # 단일 채널인 경우 3채널로 변환
+                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    
+                    # 프레임 크기 검증
+                    if frame.shape[0] < 10 or frame.shape[1] < 10:
+                        print(f"⚠️ {camera_id}: 너무 작은 프레임 크기 {frame.shape[:2]}, 건너뜀")
+                        continue
+                
                 if not ret:
                     consecutive_failures += 1
                     print(f"⚠️ {camera_id}: 프레임 읽기 실패 ({consecutive_failures}회 연속)")
@@ -660,9 +857,9 @@ def index():
                 <div class="test-form">
                     <select id="testCameraSelect">
                         <option value="">카메라 선택</option>
-                        <option value="cam-001">세집매 삼거리 (cam-001)</option>
-                        <option value="cam-002">서부역 입구 삼거리 (cam-002)</option>
+                        <!-- 동적으로 로드됨 -->
                     </select>
+                    <button onclick="loadCameraList()" style="background: #2196F3; margin-bottom: 10px;">🔄 카메라 목록 새로고침</button>
                     <button onclick="sendTestEvent()">🚗 통행량 많음 이벤트 발령</button>
                     <div id="testResult" class="test-result"></div>
                 </div>
@@ -676,6 +873,36 @@ def index():
         </div>
         
         <script>
+            // 페이지 로드 시 카메라 목록 로드
+            document.addEventListener('DOMContentLoaded', function() {{
+                loadCameraList();
+            }});
+            
+            function loadCameraList() {{
+                fetch('/api/cameras')
+                .then(response => response.json())
+                .then(cameras => {{
+                    const select = document.getElementById('testCameraSelect');
+                    // 기존 옵션들 제거 (첫 번째 "카메라 선택" 옵션은 유지)
+                    while (select.children.length > 1) {{
+                        select.removeChild(select.lastChild);
+                    }}
+                    
+                    // 새 카메라 옵션들 추가
+                    cameras.forEach(camera => {{
+                        const option = document.createElement('option');
+                        option.value = camera.id;
+                        option.textContent = `${{camera.name}} (${{camera.id}}) - ${{camera.status}}`;
+                        select.appendChild(option);
+                    }});
+                    
+                    console.log(`🎯 테스트 이벤트 목록에 ${{cameras.length}}개 카메라 로드됨`);
+                }})
+                .catch(error => {{
+                    console.error('카메라 목록 로드 실패:', error);
+                }});
+            }}
+            
             function sendTestEvent() {{
                 const selectedCameraId = document.getElementById('testCameraSelect').value;
                 const resultDiv = document.getElementById('testResult');
@@ -831,6 +1058,61 @@ def test_api():
 
 
 
+@app.route('/api/cameras')
+def get_cameras_list():
+    """현재 활성화된 카메라 목록 반환 (JSON) - 캐싱으로 안정성 향상"""
+    try:
+        # 현재 활성 카메라 목록을 RTSP_STREAMS 기반으로 생성 (더 안정적)
+        if RTSP_STREAMS:
+            active_cameras = []
+            for cam_id in RTSP_STREAMS.keys():
+                # Control Center에서 카메라 정보 가져오기 (개별 요청으로 안정성 향상)
+                try:
+                    cam_response = requests.get(f"{API_BASE}/api/cameras/{cam_id}", timeout=5)
+                    if cam_response.status_code == 200:
+                        cam_data = cam_response.json()
+                        active_cameras.append({
+                            'id': cam_id,
+                            'name': cam_data.get('name', f'카메라 {cam_id}'),
+                            'status': camera_status.get(cam_id, 'UNKNOWN'),
+                            'yoloEnabled': camera_yolo_enabled.get(cam_id, False)
+                        })
+                    else:
+                        # API 호출 실패 시 기본값 사용
+                        active_cameras.append({
+                            'id': cam_id,
+                            'name': f'카메라 {cam_id}',
+                            'status': camera_status.get(cam_id, 'UNKNOWN'),
+                            'yoloEnabled': camera_yolo_enabled.get(cam_id, False)
+                        })
+                except Exception as e:
+                    print(f"⚠️ {cam_id}: 개별 카메라 정보 조회 실패: {e}")
+                    # 예외 발생 시에도 기본값으로 응답
+                    active_cameras.append({
+                        'id': cam_id,
+                        'name': f'카메라 {cam_id}',
+                        'status': camera_status.get(cam_id, 'UNKNOWN'),
+                        'yoloEnabled': camera_yolo_enabled.get(cam_id, False)
+                    })
+            
+            return jsonify(active_cameras)
+        else:
+            # API 호출 실패 시 현재 RTSP_STREAMS 기반으로 응답
+            fallback_cameras = [
+                {
+                    'id': cam_id,
+                    'name': f'카메라 {cam_id}',
+                    'status': camera_status.get(cam_id, 'UNKNOWN'),
+                    'yoloEnabled': True
+                }
+                for cam_id in RTSP_STREAMS.keys()
+            ]
+            return jsonify(fallback_cameras)
+    except Exception as e:
+        print(f"❌ 카메라 목록 조회 오류: {e}")
+        # 오류 시 빈 배열 반환
+        return jsonify([])
+
 @app.route('/status')
 def camera_status_page():
     """카메라 상태 상세 정보"""
@@ -873,12 +1155,16 @@ def camera_status_page():
 def start_detector():
     """Detector 서버 시작 함수"""
     print("🚀 CCTV AI Detector YOLOv8 RTSP Demo 시작 중...")
-    print(f"📹 RTSP 스트림: {len(RTSP_STREAMS)}개 카메라")
     print(f"🌐 API 서버: {API_BASE}")
     print(f"🎯 탐지 임계값: {SCORE_THRESHOLD}")
     print(f"🎯 탐지 대상: 사람(person), 차량(car/truck/bus/motorcycle/bicycle)만")
     print(f"📡 이벤트 전송: 사람과 차량 탐지 시에만 API 전송")
     print(f"🚀 YOLOv8n 모델: 가장 가벼운 최신 모델 (6.7MB)")
+    
+    # 카메라 정보 로드 (데이터베이스에서)
+    print("\n🔄 카메라 정보 로드 중...")
+    load_cameras_from_api()
+    print(f"📹 RTSP 스트림: {len(RTSP_STREAMS)}개 카메라")
     
     # YOLOv8 모델 로드
     model_loaded = load_yolo_model()
@@ -888,10 +1174,21 @@ def start_detector():
         thread = threading.Thread(
             target=capture_rtsp_stream,
             args=(camera_id, rtsp_url),
-            daemon=True
+            daemon=True,
+            name=f"RTSP-{camera_id}"
         )
         thread.start()
+        camera_threads[camera_id] = thread
         print(f"🔄 {camera_id} RTSP 스트림 처리 스레드 시작")
+
+    # 주기적 카메라 정보 업데이트 스레드 시작
+    reload_thread = threading.Thread(
+        target=periodic_camera_reload,
+        daemon=True,
+        name="Camera-Reload"
+    )
+    reload_thread.start()
+    print(f"🔄 주기적 카메라 정보 업데이트 스레드 시작 ({camera_reload_interval}초 간격)")
 
     print("✅ 모든 RTSP 스트림 처리 스레드가 시작되었습니다.")
     print("🌐 웹 인터페이스: http://localhost:5001")
