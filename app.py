@@ -327,9 +327,9 @@ def capture_rtsp_stream(camera_id, rtsp_url):
                 frame_count += 1
                 camera_status[camera_id] = "ONLINE"
 
-                # YOLOv8 객체 탐지 수행 (cam-001, cam-002에서만)
+                # YOLOv8 객체 탐지 수행 (cam-001에서만 - 부하 감소)
                 detections = []
-                if camera_id in ['cam-001', 'cam-002']:
+                if camera_id == 'cam-001':
                     detections = detect_objects_yolo(frame, camera_id)
                     
                     # 차량 클래스만 필터링하여 개수 계산
